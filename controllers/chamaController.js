@@ -1184,6 +1184,9 @@ const removeMember = async (req, res) => {
 // @desc    Get chama statistics
 // @route   GET /api/chamas/:id/stats
 // @access  Private (Members only)
+// @desc    Get chama statistics
+// @route   GET /api/chamas/:id/stats
+// @access  Private (Members only)
 const getChamaStats = async (req, res) => {
   try {
     // Check if user is a member
@@ -1208,12 +1211,19 @@ const getChamaStats = async (req, res) => {
       [req.params.id]
     );
 
-    // Get total payouts
-    const [payoutResult] = await db.execute(
-      `SELECT SUM(amount) as total FROM payouts 
-       WHERE chama_id = ? AND status = 'paid'`,
-      [req.params.id]
-    );
+    // Get total payouts - handle if table doesn't exist
+    let totalPayouts = 0;
+    try {
+      const [payoutResult] = await db.execute(
+        `SELECT SUM(amount) as total FROM payouts 
+         WHERE chama_id = ? AND status = 'paid'`,
+        [req.params.id]
+      );
+      totalPayouts = payoutResult[0].total || 0;
+    } catch (error) {
+      console.warn('⚠️ Payouts table not found or error:', error.message);
+      totalPayouts = 0; // Default to 0 if table doesn't exist
+    }
 
     // Get member count
     const [memberCount] = await db.execute(
@@ -1267,8 +1277,8 @@ const getChamaStats = async (req, res) => {
       success: true,
       data: {
         totalContributions: totalResult[0].total || 0,
-        totalPayouts: payoutResult[0].total || 0,
-        currentBalance: (totalResult[0].total || 0) - (payoutResult[0].total || 0),
+        totalPayouts: totalPayouts,
+        currentBalance: (totalResult[0].total || 0) - totalPayouts,
         memberCount: memberCount[0].count,
         currentCycle: currentCycle.length > 0 ? currentCycle[0] : null,
         paidThisCycle: currentCycleContributions,
