@@ -1,5 +1,6 @@
 const db = require('../config/database');
-
+const axios = require('axios');
+const crypto = require('crypto');
 // @desc    Create a chama
 // @route   POST /api/chamas
 // @access  Private
@@ -1347,6 +1348,1210 @@ const debugChama = async (req, res) => {
     res.status(500).json({ success: false, message: 'Debug error' });
   }
 };
+// M-Pesa Configuration
+const MPESA_CONFIG = {
+  consumerKey: process.env.MPESA_CONSUMER_KEY || '',
+  consumerSecret: process.env.MPESA_CONSUMER_SECRET || '',
+  shortCode: process.env.MPESA_SHORTCODE || '',
+  passkey: process.env.MPESA_PASSKEY || '',
+  callbackURL: process.env.MPESA_CALLBACK_URL || 'https://yourdomain.com/api/payments/callback',
+  environment: process.env.MPESA_ENVIRONMENT || 'sandbox', // sandbox or production
+  transactionType: 'CustomerPayBillOnline'
+};
+
+// M-Pesa STK Push Service
+class MpesaService {
+  constructor() {
+    this.isConfigured = false;
+    
+    if (MPESA_CONFIG.consumerKey && MPESA_CONFIG.consumerSecret) {
+      this.isConfigured = true;
+      console.log('✅ M-Pesa service configured');
+    } else {
+      console.warn('⚠️ M-Pesa credentials not found. Running in simulation mode.');
+    }
+  }
+
+  /**
+   * Get M-Pesa access token
+   */
+  async getAccessToken() {
+    try {
+      const auth = Buffer.from(`${MPESA_CONFIG.consumerKey}:${MPESA_CONFIG.consumerSecret}`).toString('base64');
+      
+      const response = await axios.get(
+        MPESA_CONFIG.environment === 'production' 
+          ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
+          : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+        {
+          headers: {
+            Authorization: `Basic ${auth}`
+          }
+        }
+      );
+      
+      return response.data.access_token;
+    } catch (error) {
+      console.error('❌ M-Pesa access token error:', error.response?.data || error.message);
+      throw new Error('Failed to get M-Pesa access token');
+    }
+  }
+
+  /**
+   * Generate timestamp in M-Pesa format (YYYYMMDDHHmmss)
+   */
+  generateTimestamp() {
+    const now = new Date();
+    return now.getFullYear().toString() +
+           (now.getMonth() + 1).toString().padStart(2, '0') +
+           now.getDate().toString().padStart(2, '0') +
+           now.getHours().toString().padStart(2, '0') +
+           now.getMinutes().toString().padStart(2, '0') +
+           now.getSeconds().toString().padStart(2, '0');
+  }
+
+  /**
+   * Generate password for STK Push
+   */
+  generatePassword(shortCode, passkey, timestamp) {
+    const str = shortCode + passkey + timestamp;
+    return Buffer.from(str).toString('base64');
+  }
+
+  /**
+   * Initiate STK Push payment
+   */
+  async initiateSTKPush(phone, amount, reference, description = 'Chama Contribution') {
+    try {
+      if (!this.isConfigured) {
+        // Simulation mode
+        console.log(`📱 [SIMULATION] STK Push for ${phone}: KES ${amount}`);
+        console.log(`📱 Reference: ${reference}, Description: ${description}`);
+        
+        // Simulate successful payment after delay
+        return new Promise(resolve => {
+          setTimeout(() => {
+            resolve({
+              success: true,
+              mode: 'simulation',
+              checkoutRequestID: `SIM-${Date.now()}`,
+              merchantRequestID: `SIM-MR-${Date.now()}`,
+              customerMessage: 'Success. Request accepted for processing',
+              responseCode: '0',
+              phone: phone,
+              amount: amount,
+              reference: reference,
+              description: description
+            });
+          }, 2000);
+        });
+      }
+
+      const accessToken = await this.getAccessToken();
+      const timestamp = this.generateTimestamp();
+      const password = this.generatePassword(MPESA_CONFIG.shortCode, MPESA_CONFIG.passkey, timestamp);
+      
+      // Format phone number (remove + and leading 0)
+      let formattedPhone = phone.replace(/\D/g, '');
+      if (formattedPhone.startsWith('0')) {
+        formattedPhone = '254' + formattedPhone.substring(1);
+      } else if (formattedPhone.startsWith('254')) {
+        formattedPhone = formattedPhone;
+      } else {
+        formattedPhone = '254' + formattedPhone;
+      }
+
+      const requestData = {
+        BusinessShortCode: MPESA_CONFIG.shortCode,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: MPESA_CONFIG.transactionType,
+        Amount: Math.round(amount), // Amount in whole shillings
+        PartyA: formattedPhone,
+        PartyB: MPESA_CONFIG.shortCode,
+        PhoneNumber: formattedPhone,
+        CallBackURL: MPESA_CONFIG.callbackURL,
+        AccountReference: reference.substring(0, 12), // Max 12 chars
+        TransactionDesc: description.substring(0, 13) // Max 13 chars
+      };
+
+      console.log('🔍 Initiating STK Push with data:', requestData);
+
+      const response = await axios.post(
+        MPESA_CONFIG.environment === 'production'
+          ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+          : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+        requestData,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      console.log('✅ STK Push initiated:', response.data);
+
+      return {
+        success: true,
+        mode: 'production',
+        checkoutRequestID: response.data.CheckoutRequestID,
+        merchantRequestID: response.data.MerchantRequestID,
+        customerMessage: response.data.CustomerMessage,
+        responseCode: response.data.ResponseCode,
+        phone: phone,
+        amount: amount,
+        reference: reference,
+        description: description,
+        rawResponse: response.data
+      };
+    } catch (error) {
+      console.error('❌ STK Push error:', error.response?.data || error.message);
+      
+      const errorData = error.response?.data || {};
+      let errorMessage = 'Failed to initiate payment';
+      
+      if (errorData.errorCode === '400.002.02') {
+        errorMessage = 'Invalid phone number format';
+      } else if (errorData.errorCode === '500.001.1001') {
+        errorMessage = 'Insufficient balance';
+      } else if (errorData.errorCode) {
+        errorMessage = errorData.errorMessage || `Payment error: ${errorData.errorCode}`;
+      }
+      
+      throw new Error(errorMessage);
+    }
+  }
+
+  /**
+   * Check STK Push status
+   */
+  async checkSTKStatus(checkoutRequestID) {
+    try {
+      if (!this.isConfigured) {
+        // Simulation mode - always return success
+        return {
+          success: true,
+          mode: 'simulation',
+          resultCode: '0',
+          resultDesc: 'The service request is processed successfully.',
+          transactionComplete: true
+        };
+      }
+
+      const accessToken = await this.getAccessToken();
+      const timestamp = this.generateTimestamp();
+      const password = this.generatePassword(MPESA_CONFIG.shortCode, MPESA_CONFIG.passkey, timestamp);
+
+      const requestData = {
+        BusinessShortCode: MPESA_CONFIG.shortCode,
+        Password: password,
+        Timestamp: timestamp,
+        CheckoutRequestID: checkoutRequestID
+      };
+
+      const response = await axios.post(
+        MPESA_CONFIG.environment === 'production'
+          ? 'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query'
+          : 'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query',
+        requestData,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      const result = response.data;
+      const transactionComplete = result.ResultCode === '0';
+      
+      return {
+        success: true,
+        mode: 'production',
+        resultCode: result.ResultCode,
+        resultDesc: result.ResultDesc,
+        transactionComplete: transactionComplete,
+        rawResponse: result
+      };
+    } catch (error) {
+      console.error('❌ STK Status check error:', error.response?.data || error.message);
+      throw new Error('Failed to check payment status');
+    }
+  }
+}
+
+// Initialize M-Pesa service
+const mpesaService = new MpesaService();
+
+// @desc    Initiate M-Pesa payment for contribution
+// @route   POST /api/chamas/:id/payments/mpesa
+// @access  Private (Members can pay their own, admins can pay for others)
+const initiateMpesaPayment = async (req, res) => {
+  const { memberId, amount, phone, description } = req.body;
+  const chamaId = req.params.id;
+
+  let connection;
+  
+  try {
+    console.log('=== INITIATE MPESA PAYMENT START ===');
+    console.log('Chama:', chamaId, 'Member:', memberId, 'Amount:', amount, 'Phone:', phone);
+
+    if (!amount || !phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide amount and phone number'
+      });
+    }
+
+    // Validate amount
+    if (amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Amount must be greater than 0'
+      });
+    }
+
+    // Get database connection for transaction
+    connection = await db.getConnection();
+    
+    // Start transaction
+    await connection.beginTransaction();
+
+    // Check if user is authorized
+    const [memberCheck] = await connection.execute(
+      `SELECT m.id, m.user_id, u.name as member_name, c.contribution_amount
+       FROM members m
+       JOIN users u ON m.user_id = u.id
+       JOIN chamas c ON m.chama_id = c.id
+       WHERE m.chama_id = ? AND m.id = ?`,
+      [chamaId, memberId]
+    );
+
+    if (memberCheck.length === 0) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found in this chama'
+      });
+    }
+
+    const member = memberCheck[0];
+    
+    // Check authorization: User can pay their own contribution or admin can pay for anyone
+    const [authCheck] = await connection.execute(
+      `SELECT role FROM members 
+       WHERE chama_id = ? AND user_id = ?`,
+      [chamaId, req.user.id]
+    );
+
+    const isAdmin = authCheck.length > 0 && authCheck[0].role === 'admin';
+    const isSelfPayment = member.user_id === req.user.id;
+    
+    if (!isAdmin && !isSelfPayment) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to make payment for this member'
+      });
+    }
+
+    // Get current active cycle
+    const [currentCycle] = await connection.execute(
+      `SELECT * FROM contribution_cycles 
+       WHERE chama_id = ? AND status = 'active'
+       ORDER BY cycle_number DESC
+       LIMIT 1`,
+      [chamaId]
+    );
+
+    if (currentCycle.length === 0) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(400).json({
+        success: false,
+        message: 'No active contribution cycle found'
+      });
+    }
+
+    const cycleId = currentCycle[0].id;
+    
+    // Find or create pending contribution
+    const [pendingContribution] = await connection.execute(
+      `SELECT id, amount FROM contributions 
+       WHERE member_id = ? AND cycle_id = ? AND status = 'pending'
+       ORDER BY due_date ASC
+       LIMIT 1`,
+      [memberId, cycleId]
+    );
+
+    let contributionId;
+    let expectedAmount = amount;
+    
+    if (pendingContribution.length > 0) {
+      contributionId = pendingContribution[0].id;
+      expectedAmount = pendingContribution[0].amount;
+      
+      if (amount < expectedAmount) {
+        await connection.rollback();
+        connection.release();
+        
+        return res.status(400).json({
+          success: false,
+          message: `Amount must be at least KES ${expectedAmount} for this contribution`
+        });
+      }
+    } else {
+      // Create new contribution record
+      const [contributionResult] = await connection.execute(
+        `INSERT INTO contributions 
+         (member_id, chama_id, cycle_id, amount, due_date, status) 
+         VALUES (?, ?, ?, ?, ?, 'pending')`,
+        [
+          memberId,
+          chamaId,
+          cycleId,
+          amount,
+          new Date().toISOString().split('T')[0]
+        ]
+      );
+
+      contributionId = contributionResult.insertId;
+      expectedAmount = amount;
+    }
+
+    // Generate unique reference
+    const reference = `CHAMA${chamaId.toString().padStart(4, '0')}${Date.now().toString().slice(-6)}`;
+    
+    // Create payment record (pending)
+    const [paymentResult] = await connection.execute(
+      `INSERT INTO mpesa_payments 
+       (chama_id, member_id, contribution_id, phone_number, amount, 
+        expected_amount, reference, description, status, initiated_by) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      [
+        chamaId,
+        memberId,
+        contributionId,
+        phone,
+        amount,
+        expectedAmount,
+        reference,
+        description || `Chama ${chamaId} Contribution`,
+        req.user.id
+      ]
+    );
+
+    const mpesaPaymentId = paymentResult.insertId;
+    console.log('✅ Payment record created with ID:', mpesaPaymentId);
+
+    // Initiate STK Push
+    console.log('🔍 Initiating STK Push...');
+    const stkResult = await mpesaService.initiateSTKPush(
+      phone,
+      amount,
+      reference,
+      description || `Chama ${chamaId} Contribution`
+    );
+
+    console.log('✅ STK Push initiated:', stkResult);
+
+    // Update payment record with STK details
+    await connection.execute(
+      `UPDATE mpesa_payments 
+       SET checkout_request_id = ?, 
+           merchant_request_id = ?,
+           response_code = ?,
+           customer_message = ?,
+           status = 'initiated'
+       WHERE id = ?`,
+      [
+        stkResult.checkoutRequestID,
+        stkResult.merchantRequestID,
+        stkResult.responseCode,
+        stkResult.customerMessage,
+        mpesaPaymentId
+      ]
+    );
+
+    // Commit transaction
+    await connection.commit();
+
+    res.status(200).json({
+      success: true,
+      message: 'Payment initiated successfully. Please check your phone to complete the transaction.',
+      data: {
+        paymentId: mpesaPaymentId,
+        checkoutRequestID: stkResult.checkoutRequestID,
+        merchantRequestID: stkResult.merchantRequestID,
+        customerMessage: stkResult.customerMessage,
+        phone: phone,
+        amount: amount,
+        reference: reference,
+        transactionStatus: 'initiated'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Initiate M-Pesa payment error:', error);
+    
+    // Rollback transaction in case of error
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('❌ Rollback error:', rollbackError);
+      } finally {
+        connection.release();
+      }
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to initiate payment',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    // Always release connection if it exists
+    if (connection && connection.release) {
+      try {
+        connection.release();
+      } catch (releaseError) {
+        console.error('❌ Connection release error:', releaseError);
+      }
+    }
+  }
+};
+
+// @desc    M-Pesa payment callback (called by Safaricom)
+// @route   POST /api/payments/mpesa-callback
+// @access  Public
+const mpesaCallback = async (req, res) => {
+  console.log('=== MPESA CALLBACK RECEIVED ===');
+  console.log('Callback body:', JSON.stringify(req.body, null, 2));
+
+  let connection;
+  
+  try {
+    const callbackData = req.body;
+    
+    if (!callbackData.Body || !callbackData.Body.stkCallback) {
+      console.error('❌ Invalid callback format');
+      return res.status(400).json({ ResultCode: 1, ResultDesc: 'Invalid callback format' });
+    }
+
+    const stkCallback = callbackData.Body.stkCallback;
+    const checkoutRequestID = stkCallback.CheckoutRequestID;
+    const resultCode = stkCallback.ResultCode;
+    const resultDesc = stkCallback.ResultDesc;
+    const callbackMetadata = stkCallback.CallbackMetadata;
+
+    console.log('🔍 Processing callback for:', checkoutRequestID);
+    console.log('Result Code:', resultCode, 'Description:', resultDesc);
+
+    // Get database connection for transaction
+    connection = await db.getConnection();
+    
+    // Start transaction
+    await connection.beginTransaction();
+
+    // Find payment record
+    const [paymentRecords] = await connection.execute(
+      `SELECT * FROM mpesa_payments 
+       WHERE checkout_request_id = ?`,
+      [checkoutRequestID]
+    );
+
+    if (paymentRecords.length === 0) {
+      console.error('❌ Payment record not found for:', checkoutRequestID);
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(404).json({ ResultCode: 1, ResultDesc: 'Payment record not found' });
+    }
+
+    const payment = paymentRecords[0];
+    console.log('✅ Found payment record:', payment.id);
+
+    // Extract payment details from callback
+    let mpesaReceiptNumber = null;
+    let transactionDate = null;
+    let phoneNumber = null;
+    let amount = payment.amount;
+
+    if (callbackMetadata && callbackMetadata.Item) {
+      callbackMetadata.Item.forEach(item => {
+        if (item.Name === 'MpesaReceiptNumber') {
+          mpesaReceiptNumber = item.Value;
+        } else if (item.Name === 'TransactionDate') {
+          transactionDate = item.Value;
+        } else if (item.Name === 'PhoneNumber') {
+          phoneNumber = item.Value;
+        } else if (item.Name === 'Amount') {
+          amount = item.Value;
+        }
+      });
+    }
+
+    // Update payment record
+    const paymentStatus = resultCode === '0' ? 'completed' : 'failed';
+    
+    await connection.execute(
+      `UPDATE mpesa_payments 
+       SET status = ?,
+           result_code = ?,
+           result_description = ?,
+           mpesa_receipt_number = ?,
+           transaction_date = ?,
+           phone_number = COALESCE(?, phone_number),
+           amount = COALESCE(?, amount),
+           callback_received_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        paymentStatus,
+        resultCode,
+        resultDesc,
+        mpesaReceiptNumber,
+        transactionDate,
+        phoneNumber,
+        amount,
+        payment.id
+      ]
+    );
+
+    console.log('✅ Payment record updated with status:', paymentStatus);
+
+    // If payment successful, update contribution and record payment
+    if (resultCode === '0') {
+      // Update contribution status
+      await connection.execute(
+        `UPDATE contributions 
+         SET status = 'paid',
+             paid_date = ?,
+             payment_method = 'mpesa',
+             reference_number = ?,
+             verified_by = ?,
+             amount = COALESCE(?, amount)
+         WHERE id = ?`,
+        [
+          transactionDate ? new Date(transactionDate) : new Date(),
+          mpesaReceiptNumber,
+          payment.initiated_by,
+          amount,
+          payment.contribution_id
+        ]
+      );
+
+      // Record payment transaction
+      await connection.execute(
+        `INSERT INTO payments 
+         (chama_id, member_id, contribution_id, amount, payment_method,
+          payment_date, reference_number, recorded_by, notes) 
+         VALUES (?, ?, ?, ?, 'mpesa', ?, ?, ?, ?)`,
+        [
+          payment.chama_id,
+          payment.member_id,
+          payment.contribution_id,
+          amount,
+          transactionDate ? new Date(transactionDate) : new Date(),
+          mpesaReceiptNumber,
+          payment.initiated_by,
+          `M-Pesa payment via STK Push. Receipt: ${mpesaReceiptNumber}`
+        ]
+      );
+
+      // Update chama statistics
+      await connection.execute(
+        `UPDATE chamas 
+         SET updated_at = CURRENT_TIMESTAMP 
+         WHERE id = ?`,
+        [payment.chama_id]
+      );
+
+      console.log('✅ Contribution updated and payment recorded');
+      
+      // Get member details for notification
+      const [memberDetails] = await connection.execute(
+        `SELECT u.name, u.phone, c.name as chama_name 
+         FROM members m
+         JOIN users u ON m.user_id = u.id
+         JOIN chamas c ON m.chama_id = c.id
+         WHERE m.id = ?`,
+        [payment.member_id]
+      );
+
+      if (memberDetails.length > 0) {
+        const member = memberDetails[0];
+        
+        // Send confirmation SMS (you can integrate with your SMS service)
+        try {
+          console.log(`📱 Payment confirmation for ${member.name}: KES ${amount} to ${member.chama_name}`);
+          // await smsService.sendPaymentConfirmation(member.phone, member.name, amount, member.chama_name, mpesaReceiptNumber);
+        } catch (smsError) {
+          console.warn('⚠️ Failed to send confirmation SMS:', smsError.message);
+        }
+      }
+    }
+
+    // Commit transaction
+    await connection.commit();
+
+    // Send response to Safaricom
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Success"
+    });
+
+    console.log('✅ Callback processing completed successfully');
+
+  } catch (error) {
+    console.error('❌ M-Pesa callback error:', error);
+    
+    // Rollback transaction in case of error
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('❌ Rollback error:', rollbackError);
+      } finally {
+        connection.release();
+      }
+    }
+    
+    // Still respond to Safaricom to prevent retries
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Success" // Always return success to prevent retries
+    });
+  } finally {
+    // Always release connection if it exists
+    if (connection && connection.release) {
+      try {
+        connection.release();
+      } catch (releaseError) {
+        console.error('❌ Connection release error:', releaseError);
+      }
+    }
+  }
+};
+
+// @desc    Check payment status
+// @route   GET /api/chamas/:id/payments/:paymentId/status
+// @access  Private
+const checkPaymentStatus = async (req, res) => {
+  const { paymentId } = req.params;
+
+  try {
+    console.log('🔍 Checking payment status for ID:', paymentId);
+
+    // Get payment details
+    const [paymentRecords] = await db.execute(
+      `SELECT mp.*, u.name as member_name, c.name as chama_name
+       FROM mpesa_payments mp
+       JOIN members m ON mp.member_id = m.id
+       JOIN users u ON m.user_id = u.id
+       JOIN chamas c ON mp.chama_id = c.id
+       WHERE mp.id = ?`,
+      [paymentId]
+    );
+
+    if (paymentRecords.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment record not found'
+      });
+    }
+
+    const payment = paymentRecords[0];
+
+    // Check if user is authorized to view this payment
+    const [authCheck] = await db.execute(
+      `SELECT role FROM members 
+       WHERE chama_id = ? AND user_id = ?`,
+      [payment.chama_id, req.user.id]
+    );
+
+    const isAdmin = authCheck.length > 0 && authCheck[0].role === 'admin';
+    const isOwner = payment.initiated_by === req.user.id;
+    
+    if (!isAdmin && !isOwner) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to view this payment'
+      });
+    }
+
+    // If payment is pending and has checkout request ID, check status with M-Pesa
+    let stkStatus = null;
+    if (payment.status === 'initiated' && payment.checkout_request_id) {
+      try {
+        stkStatus = await mpesaService.checkSTKStatus(payment.checkout_request_id);
+        
+        // Update status if changed
+        if (stkStatus.transactionComplete) {
+          await db.execute(
+            `UPDATE mpesa_payments 
+             SET status = 'completed',
+                 result_code = ?,
+                 result_description = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`,
+            [stkStatus.resultCode, stkStatus.resultDesc, paymentId]
+          );
+          
+          // Also update contribution if not already done via callback
+          if (payment.contribution_id) {
+            await db.execute(
+              `UPDATE contributions 
+               SET status = 'paid',
+                   paid_date = CURRENT_DATE,
+                   payment_method = 'mpesa',
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND status = 'pending'`,
+              [payment.contribution_id]
+            );
+          }
+        }
+      } catch (statusError) {
+        console.warn('⚠️ Failed to check STK status:', statusError.message);
+      }
+    }
+
+    // Get updated payment details
+    const [updatedPayment] = await db.execute(
+      `SELECT * FROM mpesa_payments WHERE id = ?`,
+      [paymentId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        payment: updatedPayment[0],
+        stkStatus: stkStatus,
+        memberName: payment.member_name,
+        chamaName: payment.chama_name
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Check payment status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to check payment status'
+    });
+  }
+};
+
+// @desc    Get payment history for chama
+// @route   GET /api/chamas/:id/payments/history
+// @access  Private (Admin only)
+const getPaymentHistory = async (req, res) => {
+  const chamaId = req.params.id;
+  const { status, startDate, endDate, memberId } = req.query;
+
+  try {
+    // Check if user is admin
+    const [adminCheck] = await db.execute(
+      `SELECT role FROM members 
+       WHERE chama_id = ? AND user_id = ? AND role = 'admin'`,
+      [chamaId, req.user.id]
+    );
+
+    if (adminCheck.length === 0) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized as admin'
+      });
+    }
+
+    let query = `
+      SELECT mp.*, u.name as member_name, u.phone,
+             c.name as chama_name, co.amount as contribution_amount,
+             cc.cycle_number
+      FROM mpesa_payments mp
+      JOIN members m ON mp.member_id = m.id
+      JOIN users u ON m.user_id = u.id
+      JOIN chamas c ON mp.chama_id = c.id
+      LEFT JOIN contributions co ON mp.contribution_id = co.id
+      LEFT JOIN contribution_cycles cc ON co.cycle_id = cc.id
+      WHERE mp.chama_id = ?
+    `;
+    
+    const params = [chamaId];
+    
+    if (status) {
+      query += ' AND mp.status = ?';
+      params.push(status);
+    }
+    
+    if (memberId) {
+      query += ' AND mp.member_id = ?';
+      params.push(memberId);
+    }
+    
+    if (startDate) {
+      query += ' AND DATE(mp.created_at) >= ?';
+      params.push(startDate);
+    }
+    
+    if (endDate) {
+      query += ' AND DATE(mp.created_at) <= ?';
+      params.push(endDate);
+    }
+    
+    query += ' ORDER BY mp.created_at DESC';
+    
+    const [payments] = await db.execute(query, params);
+
+    // Get summary statistics
+    const totalPayments = payments.length;
+    const completedPayments = payments.filter(p => p.status === 'completed').length;
+    const pendingPayments = payments.filter(p => p.status === 'pending' || p.status === 'initiated').length;
+    const failedPayments = payments.filter(p => p.status === 'failed').length;
+    const totalAmount = payments
+      .filter(p => p.status === 'completed')
+      .reduce((sum, p) => sum + parseFloat(p.amount), 0);
+
+    res.json({
+      success: true,
+      data: {
+        payments,
+        summary: {
+          total: totalPayments,
+          completed: completedPayments,
+          pending: pendingPayments,
+          failed: failedPayments,
+          totalAmount: totalAmount
+        }
+      }
+    });
+  } catch (error) {
+    console.error('❌ Get payment history error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get payment history'
+    });
+  }
+};
+
+// @desc    Get my payment history
+// @route   GET /api/chamas/:id/my-payments
+// @access  Private
+const getMyPayments = async (req, res) => {
+  const chamaId = req.params.id;
+
+  try {
+    // Check if user is a member
+    const [member] = await db.execute(
+      'SELECT id FROM members WHERE chama_id = ? AND user_id = ?',
+      [chamaId, req.user.id]
+    );
+
+    if (member.length === 0) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not a member of this chama'
+      });
+    }
+
+    const memberId = member[0].id;
+    
+    const [payments] = await db.execute(
+      `SELECT mp.*, c.name as chama_name, co.amount as contribution_amount,
+              cc.cycle_number, mp.status as payment_status
+       FROM mpesa_payments mp
+       JOIN chamas c ON mp.chama_id = c.id
+       LEFT JOIN contributions co ON mp.contribution_id = co.id
+       LEFT JOIN contribution_cycles cc ON co.cycle_id = cc.id
+       WHERE mp.chama_id = ? AND mp.member_id = ?
+       ORDER BY mp.created_at DESC`,
+      [chamaId, memberId]
+    );
+
+    res.json({
+      success: true,
+      data: payments
+    });
+  } catch (error) {
+    console.error('❌ Get my payments error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get payment history'
+    });
+  }
+};
+
+// Update the existing recordPayment function to handle M-Pesa separately
+const recordPayment = async (req, res) => {
+  const { memberId, amount, paymentMethod, paymentDate, reference } = req.body;
+
+  let connection;
+  
+  try {
+    console.log('Recording manual payment for chama:', req.params.id, 'member:', memberId);
+    
+    // Only allow manual payments for non-M-Pesa methods
+    if (paymentMethod === 'mpesa') {
+      return res.status(400).json({
+        success: false,
+        message: 'Use /mpesa endpoint for M-Pesa payments'
+      });
+    }
+    
+    // Get database connection for transaction
+    connection = await db.getConnection();
+    
+    // Start transaction
+    await connection.beginTransaction();
+
+    // Check if user is admin
+    const [adminCheck] = await connection.execute(
+      `SELECT role FROM members 
+       WHERE chama_id = ? AND user_id = ? AND role = 'admin'`,
+      [req.params.id, req.user.id]
+    );
+
+    if (adminCheck.length === 0) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized as admin'
+      });
+    }
+
+    // Verify member belongs to chama
+    const [memberCheck] = await connection.execute(
+      'SELECT id, user_id FROM members WHERE id = ? AND chama_id = ?',
+      [memberId, req.params.id]
+    );
+
+    if (memberCheck.length === 0) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found in this chama'
+      });
+    }
+
+    // Get current active cycle
+    const [currentCycle] = await connection.execute(
+      `SELECT * FROM contribution_cycles 
+       WHERE chama_id = ? AND status = 'active'
+       ORDER BY cycle_number DESC
+       LIMIT 1`,
+      [req.params.id]
+    );
+
+    if (currentCycle.length === 0) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(400).json({
+        success: false,
+        message: 'No active contribution cycle found'
+      });
+    }
+
+    const cycleId = currentCycle[0].id;
+
+    // Find pending contribution for this member and cycle
+    const [pendingContribution] = await connection.execute(
+      `SELECT id, amount FROM contributions 
+       WHERE member_id = ? AND cycle_id = ? AND status = 'pending'
+       ORDER BY due_date ASC
+       LIMIT 1`,
+      [memberId, cycleId]
+    );
+
+    let contributionId;
+    
+    if (pendingContribution.length === 0) {
+      // No pending contribution found, create one
+      const [chama] = await connection.execute(
+        'SELECT contribution_amount FROM chamas WHERE id = ?',
+        [req.params.id]
+      );
+
+      if (chama.length === 0) {
+        await connection.rollback();
+        connection.release();
+        
+        return res.status(404).json({
+          success: false,
+          message: 'Chama not found'
+        });
+      }
+
+      const contributionAmount = amount || chama[0].contribution_amount;
+      
+      // Create new contribution record
+      const [contributionResult] = await connection.execute(
+        `INSERT INTO contributions 
+         (member_id, chama_id, cycle_id, amount, due_date, status) 
+         VALUES (?, ?, ?, ?, ?, 'paid')`,
+        [
+          memberId,
+          req.params.id,
+          cycleId,
+          contributionAmount,
+          paymentDate || new Date().toISOString().split('T')[0]
+        ]
+      );
+
+      contributionId = contributionResult.insertId;
+      console.log('✅ Created new contribution record:', contributionId);
+    } else {
+      // Update existing pending contribution
+      contributionId = pendingContribution[0].id;
+      
+      await connection.execute(
+        `UPDATE contributions 
+         SET status = 'paid', 
+             paid_date = ?,
+             payment_method = ?,
+             reference_number = ?,
+             amount = COALESCE(?, amount),
+             verified_by = ?
+         WHERE id = ?`,
+        [
+          paymentDate || new Date().toISOString().split('T')[0],
+          paymentMethod || 'cash',
+          reference || null,
+          amount || pendingContribution[0].amount,
+          req.user.id,
+          contributionId
+        ]
+      );
+
+      console.log('✅ Updated pending contribution:', contributionId);
+    }
+
+    // Record payment transaction
+    const [paymentResult] = await connection.execute(
+      `INSERT INTO payments 
+       (chama_id, member_id, contribution_id, amount, payment_method, 
+        payment_date, reference_number, recorded_by) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.params.id,
+        memberId,
+        contributionId,
+        amount || pendingContribution?.[0]?.amount || 0,
+        paymentMethod || 'cash',
+        paymentDate || new Date().toISOString().split('T')[0],
+        reference || null,
+        req.user.id
+      ]
+    );
+
+    console.log('✅ Payment recorded with ID:', paymentResult.insertId);
+
+    // Commit transaction
+    await connection.commit();
+
+    // Get updated contribution details
+    const [updatedContribution] = await db.execute(
+      `SELECT c.*, u.name as member_name, m.role
+       FROM contributions c
+       JOIN members m ON c.member_id = m.id
+       JOIN users u ON m.user_id = u.id
+       WHERE c.id = ?`,
+      [contributionId]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Payment recorded successfully',
+      data: updatedContribution[0]
+    });
+  } catch (error) {
+    console.error('❌ Record payment error:', error);
+    
+    // Rollback transaction in case of error
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('❌ Rollback error:', rollbackError);
+      } finally {
+        connection.release();
+      }
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Server error recording payment',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    // Always release connection if it exists
+    if (connection && connection.release) {
+      try {
+        connection.release();
+      } catch (releaseError) {
+        console.error('❌ Connection release error:', releaseError);
+      }
+    }
+  }
+};
+
+// Add M-Pesa payment table schema
+const createMpesaPaymentsTable = `
+CREATE TABLE IF NOT EXISTS mpesa_payments (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  chama_id INT NOT NULL,
+  member_id INT NOT NULL,
+  contribution_id INT NULL,
+  phone_number VARCHAR(20) NOT NULL,
+  amount DECIMAL(10, 2) NOT NULL,
+  expected_amount DECIMAL(10, 2) NOT NULL,
+  reference VARCHAR(50) NOT NULL UNIQUE,
+  description VARCHAR(255),
+  checkout_request_id VARCHAR(100),
+  merchant_request_id VARCHAR(100),
+  response_code VARCHAR(10),
+  customer_message VARCHAR(255),
+  result_code VARCHAR(10),
+  result_description VARCHAR(255),
+  mpesa_receipt_number VARCHAR(50),
+  transaction_date VARCHAR(20),
+  status ENUM('pending', 'initiated', 'completed', 'failed', 'cancelled') DEFAULT 'pending',
+  initiated_by INT NOT NULL,
+  callback_received_at TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (chama_id) REFERENCES chamas(id) ON DELETE CASCADE,
+  FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE,
+  FOREIGN KEY (contribution_id) REFERENCES contributions(id) ON DELETE SET NULL,
+  FOREIGN KEY (initiated_by) REFERENCES users(id),
+  INDEX idx_checkout_request (checkout_request_id),
+  INDEX idx_reference (reference),
+  INDEX idx_status (status),
+  INDEX idx_created_at (created_at),
+  INDEX idx_chama_member (chama_id, member_id)
+);
+`;
+
+// Run this during database setup
+const initializeMpesaTables = async () => {
+  try {
+    await db.execute(createMpesaPaymentsTable);
+    console.log('✅ M-Pesa payments table created/verified');
+  } catch (error) {
+    console.error('❌ Failed to create M-Pesa payments table:', error);
+  }
+};
+
+// Call this function during app startup
+initializeMpesaTables();
 
 module.exports = {
   createChama,
@@ -1360,5 +2565,11 @@ module.exports = {
   createContributionCycle,
   getContributions,
   getMyContributions,
-  debugChama
+  debugChama,
+  // M-Pesa payment functions
+  initiateMpesaPayment,
+  mpesaCallback,
+  checkPaymentStatus,
+  getPaymentHistory,
+  getMyPayments
 };
