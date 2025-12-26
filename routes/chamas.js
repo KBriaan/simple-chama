@@ -8,7 +8,7 @@ const {
   updateChama,
   addMember,
   removeMember,
-  getChamaStats,recordPayment,initiateMpesaPayment,
+  getChamaStats,initiateMpesaPayment,
   checkPaymentStatus,
   getPaymentHistory,
   getMyPayments,
@@ -44,5 +44,4 @@ router.get('/:id/my-payments', protect, getMyPayments);
 router.post('/payments/mpesa-callback', mpesaCallback);
 
 // Existing routes
-router.post('/:id/payments', protect, recordPayment); // For manual payments
 module.exports = router;

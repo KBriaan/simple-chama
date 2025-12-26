@@ -120,7 +120,6 @@ const contributionRoutes = require('./routes/contributions');
 const payoutRoutes = require('./routes/payouts');
 const reportRoutes = require('./routes/reports');
 const notificationRoutes = require('./routes/notifications');
-
 app.use('/api/auth', authRoutes);
 app.use('/api/chamas', chamaRoutes);
 app.use('/api/contributions', contributionRoutes);
