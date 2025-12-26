@@ -14,7 +14,7 @@ const {
 } = require('../controllers/authController');
 
 // Middleware for protecting routes
-const { protect } = require('../middleware/authMiddleware');
+const { protect } = require('../middleware/auth');
 
 // Rate limiting for password reset (prevent abuse)
 const rateLimit = require('express-rate-limit');
@@ -22,7 +22,7 @@ const rateLimit = require('express-rate-limit');
 // Apply rate limiting to password reset endpoints
 const resetLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 requests per window
+  max: 1100, // 5 requests per window
   message: {
     success: false,
     message: 'Too many password reset attempts. Please try again later.'

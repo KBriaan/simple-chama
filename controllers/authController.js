@@ -1,4 +1,4 @@
-// TOP OF THE FILE - Add this debugging
+// TOP OF THE FILE
 console.log('🔍 authController: Loading database...');
 const db = require('../config/database');
 console.log('🔍 authController: db loaded, has execute?', typeof db.execute === 'function');
@@ -16,6 +16,36 @@ const generateToken = (id) => {
     expiresIn: process.env.JWT_EXPIRE
   });
 };
+
+// Helper: Normalize phone number
+const normalizePhone = (phone) => {
+  if (!phone) return null;
+  
+  // Remove all non-digit characters except +
+  let normalized = phone.replace(/[^\d+]/g, '');
+  
+  // Ensure it starts with +
+  if (!normalized.startsWith('+')) {
+    // Remove leading zeros and add +254 for Kenya
+    normalized = normalized.replace(/^0+/, '');
+    
+    // Add country code
+    const defaultCountryCode = process.env.DEFAULT_COUNTRY_CODE || '254';
+    
+    // Check if already has country code
+    if (!normalized.startsWith(defaultCountryCode)) {
+      normalized = `+${defaultCountryCode}${normalized}`;
+    } else {
+      normalized = `+${normalized}`;
+    }
+  }
+  
+  return normalized;
+};
+
+// Initialize global cache
+if (!global.resetTokensCache) global.resetTokensCache = {};
+if (!global.testOTPs) global.testOTPs = {};
 
 // @desc    Register user
 // @route   POST /api/auth/register
@@ -36,11 +66,14 @@ const register = async (req, res) => {
       });
     }
 
-    // Validate phone number format
-    if (!smsService.isValidPhoneNumber(phone)) {
+    // Normalize phone number
+    const normalizedPhone = normalizePhone(phone);
+    console.log('Normalized phone:', normalizedPhone);
+
+    if (!normalizedPhone || !smsService.isValidPhoneNumber(normalizedPhone)) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide a valid phone number with country code (e.g., +919876543210)'
+        message: 'Please provide a valid phone number with country code (e.g., +254799860103)'
       });
     }
 
@@ -61,12 +94,12 @@ const register = async (req, res) => {
     console.log('🔍 Starting transaction');
     await connection.beginTransaction();
 
-    console.log('🔍 Checking if user exists:', phone);
+    console.log('🔍 Checking if user exists:', normalizedPhone);
     
     // Check if user exists
     const [existingUsers] = await connection.execute(
       'SELECT id FROM users WHERE phone = ? OR email = ?',
-      [phone, email || '']
+      [normalizedPhone, email || '']
     );
 
     if (existingUsers.length > 0) {
@@ -83,28 +116,30 @@ const register = async (req, res) => {
     // Hash password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
+    console.log('🔍 Password hashed successfully');
 
     // Insert user
     console.log('🔍 Inserting new user');
     const [result] = await connection.execute(
       'INSERT INTO users (name, phone, email, password_hash) VALUES (?, ?, ?, ?)',
-      [name, phone, email || null, hashedPassword]
+      [name, normalizedPhone, email || null, hashedPassword]
     );
+
+    console.log('🔍 User inserted with ID:', result.insertId);
 
     // Commit transaction
     console.log('🔍 Committing transaction');
     await connection.commit();
 
-    // Send welcome SMS (non-blocking, don't fail registration if SMS fails)
+    // Send welcome SMS (non-blocking)
     try {
-      const smsResult = await smsService.sendWelcomeMessage(phone, name);
-      console.log(`✅ Welcome SMS sent to ${phone}: ${smsResult.messageId}`);
+      const smsResult = await smsService.sendWelcomeMessage(normalizedPhone, name);
+      console.log(`✅ Welcome SMS sent to ${normalizedPhone}: ${smsResult.messageId}`);
     } catch (smsError) {
       console.warn('⚠️ Welcome SMS failed to send:', smsError.message);
-      // Don't fail registration if SMS fails
     }
 
-    // Get created user with a new connection (transaction is complete)
+    // Get created user
     const [users] = await db.execute(
       'SELECT id, name, phone, email, created_at FROM users WHERE id = ?',
       [result.insertId]
@@ -168,13 +203,17 @@ const login = async (req, res) => {
       });
     }
 
-    console.log('🔍 Checking for user with phone:', phone);
+    // Normalize phone number
+    const normalizedPhone = normalizePhone(phone);
+    console.log('🔍 Checking for user with phone:', normalizedPhone);
     
     // Check for user
     const [users] = await db.execute(
       'SELECT * FROM users WHERE phone = ?',
-      [phone]
+      [normalizedPhone]
     );
+
+    console.log('🔍 Users found:', users.length);
 
     if (users.length === 0) {
       return res.status(401).json({
@@ -184,9 +223,13 @@ const login = async (req, res) => {
     }
 
     const user = users[0];
+    console.log('🔍 User found:', { id: user.id, name: user.name });
 
     // Check password
+    console.log('🔍 Comparing password...');
     const isPasswordMatch = await bcrypt.compare(password, user.password_hash);
+    console.log('🔍 Password match:', isPasswordMatch);
+    
     if (!isPasswordMatch) {
       return res.status(401).json({
         success: false,
@@ -195,13 +238,13 @@ const login = async (req, res) => {
     }
 
     // Remove password from response
-    delete user.password_hash;
+    const { password_hash, reset_token, reset_token_expiry, ...userData } = user;
 
     res.json({
       success: true,
       message: 'Login successful',
       data: {
-        user,
+        user: userData,
         token: generateToken(user.id)
       }
     });
@@ -214,7 +257,7 @@ const login = async (req, res) => {
   }
 };
 
-// @desc    Forgot password - Step 1: Request reset code
+// @desc    Forgot password - Step 1: Request OTP via Twilio Verify
 // @route   POST /api/auth/forgot-password
 // @access  Public
 const forgotPassword = async (req, res) => {
@@ -224,6 +267,8 @@ const forgotPassword = async (req, res) => {
   let connection;
   
   try {
+    console.log('=== FORGOT PASSWORD START ===');
+    
     if (!phone) {
       return res.status(400).json({
         success: false,
@@ -231,15 +276,16 @@ const forgotPassword = async (req, res) => {
       });
     }
 
-    // Validate phone number format
-    if (!smsService.isValidPhoneNumber(phone)) {
+    // Normalize phone number
+    const normalizedPhone = normalizePhone(phone);
+    console.log('🔍 Forgot password for phone:', normalizedPhone);
+
+    if (!normalizedPhone || !smsService.isValidPhoneNumber(normalizedPhone)) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide a valid phone number with country code (e.g., +919876543210)'
+        message: 'Please provide a valid phone number with country code (e.g., +254799860103)'
       });
     }
-
-    console.log('🔍 Forgot password for phone:', phone);
     
     // Get a connection for transaction
     connection = await db.getConnection();
@@ -250,16 +296,13 @@ const forgotPassword = async (req, res) => {
     // Check if user exists
     const [users] = await connection.execute(
       'SELECT id, name FROM users WHERE phone = ?',
-      [phone]
+      [normalizedPhone]
     );
 
-    // Generate 6-digit reset code
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-    
+    console.log('🔍 User exists:', users.length > 0);
+
     // Generate secure token for database storage
     const resetToken = crypto.randomBytes(32).toString('hex');
-    
-    // Hash token for database storage
     const hashedResetToken = crypto
       .createHash('sha256')
       .update(resetToken)
@@ -272,72 +315,80 @@ const forgotPassword = async (req, res) => {
     if (users.length > 0) {
       const user = users[0];
       
+      console.log('🔍 Saving reset token to database for user:', user.id);
+      
       // Save reset token to database
       await connection.execute(
         'UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?',
         [hashedResetToken, resetTokenExpiry, user.id]
       );
 
-      // Initialize reset cache if not exists
-      if (!global.resetCodesCache) global.resetCodesCache = {};
-      
-      // Store reset code in cache for verification
-      global.resetCodesCache[phone] = {
-        code: resetCode,
-        token: resetToken, // Store the actual token for later verification
-        expiresAt: resetTokenExpiry,
-        attempts: 0,  // Track verification attempts
-        createdAt: new Date()
-      };
-
-      // Send SMS via Twilio
+      // Send OTP via Twilio Verify API
       try {
-        const smsResult = await smsService.sendResetCode(phone, resetCode, user.name);
+        console.log('🔍 Sending OTP via Twilio Verify...');
+        const smsResult = await smsService.sendVerificationCode(normalizedPhone, 'sms');
         
-        console.log(`✅ Reset code sent to ${phone} via ${smsResult.mode}`);
+        console.log(`✅ OTP requested for ${normalizedPhone} via ${smsResult.mode}`);
         
-        // Log SMS details in development
-        if (smsResult.mode === 'simulation') {
-          console.log(`📱 Development Reset Code for ${phone}: ${resetCode}`);
-          console.log(`📱 Cache Key: ${phone}`);
+        // Store reset token in cache for later verification
+        global.resetTokensCache[normalizedPhone] = {
+          token: resetToken,
+          expiresAt: resetTokenExpiry,
+          attempts: 0,
+          createdAt: new Date(),
+          userId: user.id,
+          phone: normalizedPhone
+        };
+        
+        console.log('🔍 Reset token stored in cache');
+        
+        // In development/simulation mode, include debug info
+        if (smsResult.mode === 'simulation' && smsResult.debugCode) {
+          console.log(`📱 DEVELOPMENT OTP for ${normalizedPhone}: ${smsResult.debugCode}`);
+          console.log(`📱 Use this code in verify-reset-code endpoint`);
+          
+          // Store for testing
+          global.testOTPs[normalizedPhone] = smsResult.debugCode;
         }
         
       } catch (smsError) {
-        console.error('❌ SMS sending failed:', smsError.message);
+        console.error('❌ OTP request failed:', smsError.message);
         
-        // Rollback transaction since SMS failed
+        // Rollback transaction since OTP request failed
         await connection.rollback();
         connection.release();
         
         return res.status(500).json({
           success: false,
-          message: smsError.message || 'Failed to send reset code. Please try again.'
+          message: smsError.message || 'Failed to send OTP. Please try again.'
         });
       }
     } else {
-      // User doesn't exist, but we still "send" SMS in simulation mode
-      // to maintain consistent timing (security measure)
-      if (process.env.NODE_ENV === 'development' || process.env.SMS_ENABLED === 'false') {
-        console.log(`📱 [SIMULATION] Would send reset code to non-existent user: ${phone}`);
-      }
-      
-      // Simulate SMS delay
+      console.log(`📱 User not found for ${normalizedPhone}, simulating for security`);
+      // Simulate API delay
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     // Commit transaction
     await connection.commit();
+    console.log('✅ Transaction committed');
 
     // Always return the same success message for security
-    // (Don't reveal whether user exists or not)
-    res.status(200).json({
+    const response = {
       success: true,
-      message: 'If an account exists with this number, a reset code has been sent.',
-      // In development, include hint about simulation mode
-      ...(process.env.NODE_ENV === 'development' && {
-        hint: 'Check console for reset code in simulation mode'
-      })
-    });
+      message: 'If an account exists with this number, an OTP has been sent.'
+    };
+    
+    // Development hint
+    if (process.env.NODE_ENV === 'development' && global.testOTPs[normalizedPhone]) {
+      response.development = {
+        note: 'In development mode - OTP available in console',
+        phone: normalizedPhone
+      };
+    }
+    
+    res.status(200).json(response);
+    
   } catch (error) {
     console.error('❌ Forgot password error:', error);
     
@@ -368,102 +419,109 @@ const forgotPassword = async (req, res) => {
   }
 };
 
-// @desc    Verify reset code - Step 2: Verify the 6-digit code
+// @desc    Verify OTP - Step 2: Verify the OTP from Twilio Verify
 // @route   POST /api/auth/verify-reset-code
 // @access  Public
 const verifyResetCode = async (req, res) => {
   const { phone, code } = req.body;
   
   try {
+    console.log('=== VERIFY RESET CODE START ===');
+    
     if (!phone || !code) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide phone number and reset code'
+        message: 'Please provide phone number and OTP'
       });
     }
 
-    // Validate phone number format
-    if (!smsService.isValidPhoneNumber(phone)) {
+    // Normalize phone number
+    const normalizedPhone = normalizePhone(phone);
+    console.log(`🔍 Verifying OTP for ${normalizedPhone}: ${code}`);
+
+    if (!normalizedPhone) {
       return res.status(400).json({
         success: false,
         message: 'Please provide a valid phone number'
       });
     }
 
-    console.log(`🔍 Verifying reset code for ${phone}: ${code}`);
-
-    // Check if reset code exists in cache
-    const resetData = global.resetCodesCache?.[phone];
-    
-    if (!resetData) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid or expired reset code. Please request a new one.'
-      });
-    }
-    
-    // Check if code has expired
-    if (new Date() > new Date(resetData.expiresAt)) {
-      delete global.resetCodesCache[phone];
-      return res.status(400).json({
-        success: false,
-        message: 'Reset code has expired. Please request a new one.'
-      });
-    }
-    
-    // Check verification attempts (prevent brute force)
-    if (resetData.attempts >= 3) {
-      delete global.resetCodesCache[phone];
-      return res.status(400).json({
-        success: false,
-        message: 'Too many failed attempts. Please request a new code.'
-      });
-    }
-    
-    // Verify the code
-    if (resetData.code !== code.toString()) { // Convert to string for comparison
-      resetData.attempts += 1;
-      global.resetCodesCache[phone] = resetData;
+    // Verify OTP using Twilio Verify API
+    try {
+      console.log('🔍 Calling Twilio Verify API...');
+      const verificationResult = await smsService.verifyCode(normalizedPhone, code);
       
-      const attemptsLeft = 3 - resetData.attempts;
+      console.log('🔍 Verification result:', verificationResult);
       
-      return res.status(400).json({
-        success: false,
-        message: `Invalid code. ${attemptsLeft} attempt(s) left.`,
-        attemptsLeft: attemptsLeft
-      });
-    }
-    
-    // Code is valid - generate a verification token for password reset
-    const verificationToken = crypto.randomBytes(32).toString('hex');
-    
-    // Update cache with verification status
-    resetData.verified = true;
-    resetData.verificationToken = verificationToken;
-    resetData.verifiedAt = new Date();
-    global.resetCodesCache[phone] = resetData;
-    
-    console.log(`✅ Reset code verified for ${phone}`);
-    
-    res.status(200).json({
-      success: true,
-      message: 'Code verified successfully',
-      data: {
-        verificationToken: verificationToken,
-        expiresAt: resetData.expiresAt
+      if (!verificationResult.valid) {
+        return res.status(400).json({
+          success: false,
+          message: verificationResult.message || 'Invalid OTP'
+        });
       }
-    });
+      
+      console.log(`✅ OTP verified successfully for ${normalizedPhone}`);
+      
+      // Check if we have a reset token for this phone
+      const resetData = global.resetTokensCache[normalizedPhone];
+      
+      if (!resetData) {
+        console.log('❌ No reset token found in cache for:', normalizedPhone);
+        return res.status(400).json({
+          success: false,
+          message: 'No password reset request found. Please start over.'
+        });
+      }
+      
+      // Check if token has expired
+      if (new Date() > new Date(resetData.expiresAt)) {
+        delete global.resetTokensCache[normalizedPhone];
+        console.log('❌ Reset token expired for:', normalizedPhone);
+        return res.status(400).json({
+          success: false,
+          message: 'Reset request has expired. Please request a new OTP.'
+        });
+      }
+      
+      // Generate a verification token for password reset
+      const verificationToken = crypto.randomBytes(32).toString('hex');
+      
+      // Update cache with verification status
+      resetData.verified = true;
+      resetData.verificationToken = verificationToken;
+      resetData.verifiedAt = new Date();
+      global.resetTokensCache[normalizedPhone] = resetData;
+      
+      console.log('✅ Verification token generated:', verificationToken.substring(0, 20) + '...');
+      
+      res.status(200).json({
+        success: true,
+        message: 'OTP verified successfully',
+        data: {
+          verificationToken: verificationToken,
+          expiresAt: resetData.expiresAt
+        }
+      });
+      
+    } catch (verifyError) {
+      console.error('❌ OTP verification error:', verifyError.message);
+      
+      return res.status(400).json({
+        success: false,
+        message: verifyError.message || 'OTP verification failed'
+      });
+    }
     
   } catch (error) {
     console.error('❌ Verify reset code error:', error);
     res.status(500).json({
       success: false,
-      message: 'Server error verifying code'
+      message: 'Server error verifying OTP'
     });
   }
 };
 
-// @desc    Reset password - Step 3: Reset password with verified token
+// @desc    Reset password - Step 3: Reset password after OTP verification
 // @route   POST /api/auth/reset-password
 // @access  Public
 const resetPassword = async (req, res) => {
@@ -473,15 +531,25 @@ const resetPassword = async (req, res) => {
   let connection;
   
   try {
+    console.log('=== RESET PASSWORD START ===');
+    console.log('Phone:', phone);
+    console.log('Verification Token:', verificationToken?.substring(0, 20) + '...');
+    console.log('New Password Length:', newPassword?.length);
+
+    // Validate input
     if (!phone || !verificationToken || !newPassword) {
+      console.log('❌ Missing required fields');
       return res.status(400).json({
         success: false,
         message: 'Please provide phone, verification token, and new password'
       });
     }
 
-    // Validate phone number format
-    if (!smsService.isValidPhoneNumber(phone)) {
+    // Normalize phone number
+    const normalizedPhone = normalizePhone(phone);
+    console.log('Normalized Phone:', normalizedPhone);
+
+    if (!normalizedPhone) {
       return res.status(400).json({
         success: false,
         message: 'Please provide a valid phone number'
@@ -496,65 +564,94 @@ const resetPassword = async (req, res) => {
       });
     }
 
-    console.log(`🔍 Resetting password for ${phone}`);
+    // Check cache
+    const resetData = global.resetTokensCache[normalizedPhone];
+    console.log('Cache entry found:', !!resetData);
+    
+    if (!resetData) {
+      return res.status(400).json({
+        success: false,
+        message: 'No password reset request found. Please start over.'
+      });
+    }
 
-    // Verify the verification token from cache
-    const resetData = global.resetCodesCache?.[phone];
-    
-    if (!resetData || 
-        !resetData.verified || 
-        resetData.verificationToken !== verificationToken) {
+    console.log('Cache data:', {
+      verified: resetData.verified,
+      verificationTokenMatch: resetData.verificationToken === verificationToken,
+      expiresAt: resetData.expiresAt,
+      verifiedAt: resetData.verifiedAt
+    });
+
+    // Verify the verification token
+    if (!resetData.verified || resetData.verificationToken !== verificationToken) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired verification. Please start the reset process over.'
+        message: 'Invalid or expired verification token'
       });
     }
     
-    // Check if verification has expired
+    // Check if verification has expired (15 minutes)
     if (new Date() > new Date(resetData.expiresAt)) {
-      delete global.resetCodesCache[phone];
+      delete global.resetTokensCache[normalizedPhone];
       return res.status(400).json({
         success: false,
-        message: 'Verification expired. Please request a new code.'
+        message: 'Reset session has expired. Please request a new OTP.'
       });
     }
     
-    // Get a connection for transaction
+    // Get database connection for transaction
+    console.log('🔍 Getting database connection...');
     connection = await db.getConnection();
     
     // Start transaction
+    console.log('🔍 Starting transaction...');
     await connection.beginTransaction();
 
     // Hash the reset token to compare with stored hash
-    const hashedToken = crypto
+    const hashedResetToken = crypto
       .createHash('sha256')
       .update(resetData.token)
       .digest('hex');
-
+    
+    console.log('🔍 Looking for user with reset token...');
+    
     // Find user with valid reset token
     const [users] = await connection.execute(
-      'SELECT id, reset_token_expiry FROM users WHERE phone = ? AND reset_token = ?',
-      [phone, hashedToken]
+      'SELECT id, password_hash, reset_token, reset_token_expiry FROM users WHERE phone = ? AND reset_token = ?',
+      [normalizedPhone, hashedResetToken]
     );
 
+    console.log('🔍 Users found with reset token:', users.length);
+    
     if (users.length === 0) {
-      // Rollback transaction before returning error
+      console.log('❌ No user found with matching reset token');
+      
+      // Also check user exists at all
+      const [allUsers] = await connection.execute(
+        'SELECT id FROM users WHERE phone = ?',
+        [normalizedPhone]
+      );
+      console.log('🔍 Total users with this phone:', allUsers.length);
+      
       await connection.rollback();
       connection.release();
       
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired reset session'
+        message: 'Invalid reset session. Please start over.'
       });
     }
 
     const user = users[0];
+    console.log('🔍 User ID:', user.id);
+    console.log('🔍 Current reset token expiry in DB:', user.reset_token_expiry);
     
     // Double-check token expiry in database
     if (new Date() > new Date(user.reset_token_expiry)) {
-      // Rollback transaction before returning error
       await connection.rollback();
       connection.release();
+      
+      delete global.resetTokensCache[normalizedPhone];
       
       return res.status(400).json({
         success: false,
@@ -562,27 +659,63 @@ const resetPassword = async (req, res) => {
       });
     }
 
+    // Check if new password is same as old password
+    console.log('🔍 Checking if new password is same as old...');
+    const isSamePassword = await bcrypt.compare(newPassword, user.password_hash);
+    
+    if (isSamePassword) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(400).json({
+        success: false,
+        message: 'New password cannot be the same as old password'
+      });
+    }
+
     // Hash new password
+    console.log('🔍 Hashing new password...');
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
-    
+    console.log('🔍 New password hashed');
+
     // Update password and clear reset token
-    await connection.execute(
+    console.log('🔍 Updating password in database...');
+    const [updateResult] = await connection.execute(
       'UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expiry = NULL WHERE id = ?',
       [hashedPassword, user.id]
     );
+    
+    console.log('🔍 Update affected rows:', updateResult.affectedRows);
+
+    // Verify the update
+    const [updatedUser] = await connection.execute(
+      'SELECT password_hash FROM users WHERE id = ?',
+      [user.id]
+    );
+    
+    console.log('🔍 Password updated successfully');
+    console.log('🔍 New hash in DB:', updatedUser[0].password_hash.substring(0, 20) + '...');
 
     // Commit transaction
+    console.log('🔍 Committing transaction...');
     await connection.commit();
     
-    // Clean up the cache after successful reset
-    delete global.resetCodesCache[phone];
-
-    console.log(`✅ Password reset successful for ${phone}`);
+    // Clean up cache
+    delete global.resetTokensCache[normalizedPhone];
+    if (global.testOTPs && global.testOTPs[normalizedPhone]) {
+      delete global.testOTPs[normalizedPhone];
+    }
+    
+    console.log('✅ Password reset completed successfully');
 
     res.status(200).json({
       success: true,
-      message: 'Password reset successful. You can now login with your new password.'
+      message: 'Password reset successful. You can now login with your new password.',
+      data: {
+        phone: normalizedPhone,
+        resetAt: new Date().toISOString()
+      }
     });
   } catch (error) {
     console.error('❌ Reset password error:', error);
@@ -590,6 +723,7 @@ const resetPassword = async (req, res) => {
     // Rollback transaction in case of error
     if (connection) {
       try {
+        console.log('🔍 Rolling back transaction...');
         await connection.rollback();
       } catch (rollbackError) {
         console.error('❌ Rollback error:', rollbackError);
@@ -600,7 +734,8 @@ const resetPassword = async (req, res) => {
     
     res.status(500).json({
       success: false,
-      message: 'Server error resetting password'
+      message: 'Server error resetting password',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   } finally {
     // Always release connection if it exists
@@ -631,7 +766,6 @@ const changePassword = async (req, res) => {
       });
     }
 
-    // Validate new password strength
     if (newPassword.length < 8) {
       return res.status(400).json({
         success: false,
@@ -652,7 +786,6 @@ const changePassword = async (req, res) => {
     );
 
     if (users.length === 0) {
-      // Rollback transaction before returning error
       await connection.rollback();
       connection.release();
       
@@ -667,13 +800,23 @@ const changePassword = async (req, res) => {
     // Verify current password
     const isPasswordMatch = await bcrypt.compare(currentPassword, user.password_hash);
     if (!isPasswordMatch) {
-      // Rollback transaction before returning error
       await connection.rollback();
       connection.release();
       
       return res.status(401).json({
         success: false,
         message: 'Current password is incorrect'
+      });
+    }
+
+    // Check if new password is same as current
+    if (currentPassword === newPassword) {
+      await connection.rollback();
+      connection.release();
+      
+      return res.status(400).json({
+        success: false,
+        message: 'New password cannot be the same as current password'
       });
     }
 
@@ -773,7 +916,6 @@ const updateProfile = async (req, res) => {
     }
 
     if (email) {
-      // Validate email format
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       if (!emailRegex.test(email)) {
         return res.status(400).json({
@@ -800,7 +942,7 @@ const updateProfile = async (req, res) => {
     // Start transaction
     await connection.beginTransaction();
 
-    // Check if email is already taken by another user
+    // Check if email is already taken
     if (email) {
       const [existingEmail] = await connection.execute(
         'SELECT id FROM users WHERE email = ? AND id != ?',
@@ -825,7 +967,7 @@ const updateProfile = async (req, res) => {
     // Commit transaction
     await connection.commit();
 
-    // Get updated user with a new connection
+    // Get updated user
     const [users] = await db.execute(
       'SELECT id, name, phone, email, created_at FROM users WHERE id = ?',
       [req.user.id]
@@ -855,7 +997,6 @@ const updateProfile = async (req, res) => {
       message: 'Server error'
     });
   } finally {
-    // Always release connection if it exists
     if (connection && connection.release) {
       try {
         connection.release();
@@ -866,75 +1007,158 @@ const updateProfile = async (req, res) => {
   }
 };
 
-// @desc    Check reset code status (for debugging/testing)
-// @route   GET /api/auth/debug-reset-codes
-// @access  Private (Development only)
-const debugResetCodes = async (req, res) => {
+// @desc    Debug user password (development only)
+// @route   GET /api/auth/debug-user/:phone
+// @access  Development only
+const debugUserPassword = async (req, res) => {
   if (process.env.NODE_ENV !== 'development') {
-    return res.status(403).json({
-      success: false,
-      message: 'Access denied'
-    });
+    return res.status(403).json({ success: false, message: 'Access denied' });
   }
 
   try {
-    const codes = global.resetCodesCache || {};
+    const { phone } = req.params;
+    const normalizedPhone = normalizePhone(phone);
     
+    const [users] = await db.execute(
+      'SELECT id, phone, password_hash, reset_token, reset_token_expiry, created_at FROM users WHERE phone = ?',
+      [normalizedPhone]
+    );
+
+    if (users.length === 0) {
+      return res.json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const user = users[0];
+    
+    // Test common passwords
+    const testPasswords = [
+      'NewSecurePassword456!',
+      'test123',
+      'password',
+      '123456'
+    ];
+    
+    const passwordTests = {};
+    for (const password of testPasswords) {
+      try {
+        const match = await bcrypt.compare(password, user.password_hash);
+        passwordTests[password] = match ? '✅ MATCHES' : '❌ NO MATCH';
+      } catch (error) {
+        passwordTests[password] = '❌ ERROR: ' + error.message;
+      }
+    }
+
     res.json({
       success: true,
       data: {
-        totalCodes: Object.keys(codes).length,
-        codes: codes
+        user: {
+          id: user.id,
+          phone: user.phone,
+          has_password: !!user.password_hash,
+          password_length: user.password_hash ? user.password_hash.length : 0,
+          reset_token: user.reset_token ? 'Present' : 'None',
+          reset_token_expiry: user.reset_token_expiry,
+          created_at: user.created_at
+        },
+        passwordTests,
+        hash_sample: user.password_hash ? user.password_hash.substring(0, 30) + '...' : null,
+        cache_status: global.resetTokensCache[normalizedPhone] ? 'Present' : 'Not in cache'
       }
     });
   } catch (error) {
     console.error('Debug error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Debug error'
-    });
+    res.status(500).json({ success: false, message: 'Debug error' });
   }
 };
 
-// @desc    Clear expired reset codes (cleanup)
-// @route   POST /api/auth/cleanup-reset-codes
-// @access  Private (Admin/Development)
-const cleanupResetCodes = async (req, res) => {
+// @desc    Debug reset tokens cache
+// @route   GET /api/auth/debug-reset-tokens
+// @access  Development only
+const debugResetTokens = async (req, res) => {
+  if (process.env.NODE_ENV !== 'development') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
+
   try {
-    if (!global.resetCodesCache) {
-      return res.json({
-        success: true,
-        message: 'No reset codes to clean up',
-        cleaned: 0
+    const cache = global.resetTokensCache || {};
+    const now = new Date();
+    
+    const formattedCache = {};
+    for (const [phone, data] of Object.entries(cache)) {
+      formattedCache[phone] = {
+        ...data,
+        token: data.token?.substring(0, 10) + '...',
+        verificationToken: data.verificationToken?.substring(0, 10) + '...',
+        isExpired: now > new Date(data.expiresAt),
+        ageMinutes: Math.round((now - new Date(data.createdAt)) / (60 * 1000)),
+        verified: data.verified || false
+      };
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        totalEntries: Object.keys(cache).length,
+        cache: formattedCache,
+        testOTPs: global.testOTPs || {}
+      }
+    });
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({ success: false, message: 'Debug error' });
+  }
+};
+
+// @desc    Test login with specific password
+// @route   POST /api/auth/test-login
+// @access  Development only
+const testLogin = async (req, res) => {
+  if (process.env.NODE_ENV !== 'development') {
+    return res.status(403).json({ success: false, message: 'Access denied' });
+  }
+
+  try {
+    const { phone, password } = req.body;
+    
+    if (!phone || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide phone and password'
       });
     }
 
-    const now = new Date();
-    let cleanedCount = 0;
-    const codes = global.resetCodesCache;
+    const normalizedPhone = normalizePhone(phone);
+    
+    const [users] = await db.execute(
+      'SELECT * FROM users WHERE phone = ?',
+      [normalizedPhone]
+    );
 
-    // Clean expired codes
-    for (const [phone, data] of Object.entries(codes)) {
-      if (now > new Date(data.expiresAt)) {
-        delete codes[phone];
-        cleanedCount++;
-      }
+    if (users.length === 0) {
+      return res.json({
+        success: false,
+        message: 'User not found'
+      });
     }
 
-    global.resetCodesCache = codes;
-
+    const user = users[0];
+    const isPasswordMatch = await bcrypt.compare(password, user.password_hash);
+    
     res.json({
       success: true,
-      message: `Cleaned up ${cleanedCount} expired reset codes`,
-      cleaned: cleanedCount,
-      remaining: Object.keys(codes).length
+      data: {
+        userFound: true,
+        userId: user.id,
+        passwordMatch: isPasswordMatch,
+        passwordHash: user.password_hash.substring(0, 30) + '...'
+      }
     });
   } catch (error) {
-    console.error('Cleanup error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Cleanup error'
-    });
+    console.error('Test login error:', error);
+    res.status(500).json({ success: false, message: 'Test error' });
   }
 };
 
@@ -947,6 +1171,7 @@ module.exports = {
   changePassword,
   getMe,
   updateProfile,
-  debugResetCodes,
-  cleanupResetCodes
+  debugUserPassword,
+  debugResetTokens,
+  testLogin
 };
