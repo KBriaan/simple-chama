@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-   "db:reset": "mysql -u root -p < database_schema.sql",
+    "db:reset": "mysql -u root -p < database_schema.sql",
     "db:seed": "node seeders/seed.js",
     "db:notifications": "node scripts/checkNotifications.js"
   },
@@ -34,6 +34,7 @@
     "redis": "^4.6.8",
     "sequelize": "^6.32.1",
     "socket.io": "^4.6.1",
+    "twilio": "^5.11.1",
     "uuid": "^9.0.0",
     "winston": "^3.10.0"
   },
