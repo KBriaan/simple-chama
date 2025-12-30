@@ -2359,7 +2359,6 @@ module.exports = {
   getContributions,
   getMyContributions,
   debugChama,
-  // M-Pesa payment functions
   initiateMpesaPayment,
   mpesaCallback,
   checkPaymentStatus,
